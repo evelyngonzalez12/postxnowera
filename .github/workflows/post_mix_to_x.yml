@@ -1,0 +1,222 @@
+# ============================================================
+# Post Mix (Images + Videos + Threads + Link Previews) to X
+# Media: mega.nz via rclone | Settings: Google Sheet (OAuth)
+# Secrets: MEGA_RCLONE_CONF + GOOGLE_OAUTH_JSON only
+# ============================================================
+name: Post Mix (Images + Videos + Threads + Links) to X
+
+on:
+  workflow_dispatch:
+    inputs:
+      post_count:
+        description: "Total posts this run (split across types below)"
+        required: false
+        default: "10"
+      image_percent:
+        description: "Percentage images (0-100)"
+        required: false
+        default: "30"
+      video_percent:
+        description: "Percentage videos (0-100)"
+        required: false
+        default: "25"
+      thread_percent:
+        description: "Percentage sheet threads (0-100)"
+        required: false
+        default: "20"
+      link_percent:
+        description: "Percentage link-preview posts (0-100)"
+        required: false
+        default: "25"
+      caption_source:
+        description: "Caption for IMAGE/VIDEO only (threads/links use their own tabs)"
+        type: choice
+        options:
+          - filename
+          - custom
+        default: filename
+      parallel_jobs:
+        description: "Parallel worker jobs (1-10)"
+        required: false
+        default: "3"
+      interval_minutes:
+        description: "Minutes between posts inside each worker"
+        required: false
+        default: "10"
+      shuffle:
+        description: "Shuffle post order? (true/false)"
+        required: false
+        default: "true"
+      spreadsheet_id:
+        description: "Google Sheet ID"
+        required: false
+        default: "1QXCzLY_ygvJlCxdgDyh_oYkBxm5jSfDp56jtYQ1FVYw"
+      mega_source_folder:
+        description: "mega source folder name (override Settings tab)"
+        required: false
+        default: ""
+      mega_claimed_folder:
+        description: "mega claimed folder name (override Settings tab)"
+        required: false
+        default: ""
+      unlock_stale_hours:
+        description: "Auto-unlock accounts locked longer than this many hours"
+        required: false
+        default: "6"
+
+concurrency:
+  group: post-mix-x-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      total_jobs: ${{ steps.plan.outputs.total_jobs }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install gspread google-auth google-auth-oauthlib google-auth-httplib2
+
+      - name: Write Google OAuth credentials
+        env:
+          GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
+        run: printf '%s' "$GOOGLE_OAUTH_JSON" > google_oauth.json
+
+      - name: Plan work (dynamic locks, no LockQueue sheet)
+        id: plan
+        env:
+          GOOGLE_OAUTH_PATH: google_oauth.json
+          SPREADSHEET_ID: ${{ github.event.inputs.spreadsheet_id }}
+          POST_COUNT: ${{ github.event.inputs.post_count }}
+          IMAGE_PERCENT: ${{ github.event.inputs.image_percent }}
+          VIDEO_PERCENT: ${{ github.event.inputs.video_percent }}
+          THREAD_PERCENT: ${{ github.event.inputs.thread_percent }}
+          LINK_PERCENT: ${{ github.event.inputs.link_percent }}
+          PARALLEL_JOBS: ${{ github.event.inputs.parallel_jobs }}
+          CAPTION_SOURCE: ${{ github.event.inputs.caption_source }}
+          SHUFFLE_ORDER: ${{ github.event.inputs.shuffle }}
+          MEGA_SOURCE_FOLDER_OVERRIDE: ${{ github.event.inputs.mega_source_folder }}
+          MEGA_CLAIMED_FOLDER_OVERRIDE: ${{ github.event.inputs.mega_claimed_folder }}
+          UNLOCK_STALE_HOURS: ${{ github.event.inputs.unlock_stale_hours }}
+          RUN_ID: ${{ github.run_id }}
+        run: python prepare_mix_jobs.py
+
+      - name: Upload job plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: job-plan-${{ github.run_id }}
+          path: job_plan.json
+          retention-days: 1
+
+  post:
+    needs: prepare
+    if: needs.prepare.outputs.total_jobs != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    concurrency:
+      group: post-mix-worker-${{ github.run_id }}-${{ matrix.worker_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Write secrets to files
+        env:
+          GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
+          MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
+        run: |
+          printf '%s' "$GOOGLE_OAUTH_JSON" > google_oauth.json
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$MEGA_RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          # Ensure remote is named "mega" — if user pasted without [mega] header, wrap it
+          if ! grep -q '^\[mega\]' ~/.config/rclone/rclone.conf; then
+            {
+              echo '[mega]'
+              echo 'type = mega'
+              cat ~/.config/rclone/rclone.conf
+            } > ~/.config/rclone/rclone.conf.tmp
+            mv ~/.config/rclone/rclone.conf.tmp ~/.config/rclone/rclone.conf
+          fi
+          echo "rclone remotes:" && rclone listremotes || true
+
+      - name: Install Python dependencies
+        run: |
+          pip install playwright gspread google-auth google-auth-oauthlib \
+                      google-auth-httplib2
+          playwright install --with-deps chromium
+
+      - name: Download job plan
+        uses: actions/download-artifact@v4
+        with:
+          name: job-plan-${{ github.run_id }}
+          path: .
+
+      - name: Run worker
+        env:
+          GOOGLE_OAUTH_PATH: google_oauth.json
+          SPREADSHEET_ID: ${{ github.event.inputs.spreadsheet_id }}
+          WORKER_ID: ${{ matrix.worker_id }}
+          RUN_ID: ${{ github.run_id }}
+          CAPTION_SOURCE: ${{ github.event.inputs.caption_source }}
+          INTERVAL_MINUTES: ${{ github.event.inputs.interval_minutes }}
+          RUN_BUDGET_MINUTES: "355"
+          RCLONE_REMOTE: mega
+        run: python post_mix_worker.py
+
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots-worker-${{ matrix.worker_id }}
+          path: debug_screenshots/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  cleanup:
+    needs: [prepare, post]
+    if: always() && needs.prepare.outputs.total_jobs != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install gspread google-auth google-auth-oauthlib google-auth-httplib2
+      - name: Write Google OAuth
+        env:
+          GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
+        run: printf '%s' "$GOOGLE_OAUTH_JSON" > google_oauth.json
+      - name: Release account locks for this run
+        env:
+          GOOGLE_OAUTH_PATH: google_oauth.json
+          SPREADSHEET_ID: ${{ github.event.inputs.spreadsheet_id }}
+          RUN_ID: ${{ github.run_id }}
+        run: python release_account_locks.py
