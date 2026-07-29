@@ -1,0 +1,142 @@
+cat > /home/workdir/artifacts/post_mix_to_x.yml << 'YAMLEOF'
+# ============================================================
+# Post Mix (Images + Videos + Threads) to X — Multi-Job
+# Media: mega.nz   Settings/Captions/Accounts/Locks: Google Sheet
+# ============================================================
+name: Post Mix (Images + Videos + Threads) to X
+
+on:
+  workflow_dispatch:
+    inputs:
+      post_count:
+        description: "Total posts this run (split across types; divided across parallel jobs)"
+        required: false
+        default: "10"
+      image_percent:
+        description: "Percentage of posts that are images (0-100)"
+        required: false
+        default: "40"
+      video_percent:
+        description: "Percentage of posts that are videos (0-100)"
+        required: false
+        default: "30"
+      thread_percent:
+        description: "Percentage of posts that are sheet threads (0-100)"
+        required: false
+        default: "30"
+      caption_source:
+        description: "Caption for IMAGE/VIDEO only (threads always use Threads tab)"
+        type: choice
+        options:
+          - filename
+          - custom
+        default: filename
+      parallel_jobs:
+        description: "How many parallel worker jobs (1-10). Each claims work via Sheet locks."
+        required: false
+        default: "3"
+      interval_minutes:
+        description: "Minutes to wait between posts inside each worker"
+        required: false
+        default: "10"
+      shuffle:
+        description: "Shuffle post order? (true/false)"
+        required: false
+        default: "true"
+      spreadsheet_id:
+        description: "Google Sheet ID (all tabs live here)"
+        required: false
+        default: "1QXCzLY_ygvJlCxdgDyh_oYkBxm5jSfDp56jtYQ1FVYw"
+      mega_source_folder:
+        description: "mega.nz SOURCE folder name (override Settings tab)"
+        required: false
+        default: ""
+      mega_claimed_folder:
+        description: "mega.nz CLAIMED folder name (override Settings tab)"
+        required: false
+        default: ""
+
+concurrency:
+  group: post-mix-x-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      total_jobs: ${{ steps.plan.outputs.total_jobs }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install gspread google-auth google-auth-oauthlib google-auth-httplib2
+      - name: Plan work and seed locks
+        id: plan
+        env:
+          SHEET_CREDENTIALS_JSON: ${{ secrets.SHEET_CREDENTIALS_JSON }}
+          SPREADSHEET_ID: ${{ github.event.inputs.spreadsheet_id }}
+          POST_COUNT: ${{ github.event.inputs.post_count }}
+          IMAGE_PERCENT: ${{ github.event.inputs.image_percent }}
+          VIDEO_PERCENT: ${{ github.event.inputs.video_percent }}
+          THREAD_PERCENT: ${{ github.event.inputs.thread_percent }}
+          PARALLEL_JOBS: ${{ github.event.inputs.parallel_jobs }}
+          CAPTION_SOURCE: ${{ github.event.inputs.caption_source }}
+          SHUFFLE_ORDER: ${{ github.event.inputs.shuffle }}
+          MEGA_SOURCE_FOLDER_OVERRIDE: ${{ github.event.inputs.mega_source_folder }}
+          MEGA_CLAIMED_FOLDER_OVERRIDE: ${{ github.event.inputs.mega_claimed_folder }}
+          RUN_ID: ${{ github.run_id }}
+        run: python prepare_mix_jobs.py
+
+  post:
+    needs: prepare
+    if: needs.prepare.outputs.total_jobs != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    concurrency:
+      group: post-mix-worker-${{ github.run_id }}-${{ matrix.worker_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python dependencies
+        run: |
+          pip install playwright gspread google-auth google-auth-oauthlib \
+                      google-auth-httplib2 mega.py tenacity
+          playwright install --with-deps chromium
+      - name: Run worker
+        env:
+          SHEET_CREDENTIALS_JSON: ${{ secrets.SHEET_CREDENTIALS_JSON }}
+          SPREADSHEET_ID: ${{ github.event.inputs.spreadsheet_id }}
+          WORKER_ID: ${{ matrix.worker_id }}
+          RUN_ID: ${{ github.run_id }}
+          CAPTION_SOURCE: ${{ github.event.inputs.caption_source }}
+          INTERVAL_MINUTES: ${{ github.event.inputs.interval_minutes }}
+          RUN_BUDGET_MINUTES: "355"
+          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+        run: python post_mix_worker.py
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots-worker-${{ matrix.worker_id }}
+          path: debug_screenshots/
+          if-no-files-found: ignore
+          retention-days: 7
+YAMLEOF
+echo "YAML written OK"
+YAML written OK
