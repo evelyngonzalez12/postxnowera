@@ -1,43 +1,48 @@
 #!/usr/bin/env python3
-"""post_mix_worker.py - multi-job worker with mega.nz + sheet locks + rate limits"""
+"""
+post_mix_worker.py
+- Reads job_plan.json (jobs assigned to this worker_id)
+- Media via rclone (remote "mega") — no mega_node_id
+- Posts image / video / thread / link-preview to X
+- No LockQueue sheet; account locks released by cleanup job
+"""
 from __future__ import annotations
-import json, os, random, sys, tempfile, time
-from collections import deque
+
+import json
+import os
+import random
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Optional
-import gspread
-from google.oauth2.service_account import Credentials as SACredentials
-from google.oauth2.credentials import Credentials as UserCredentials
-from playwright.sync_api import sync_playwright
-try:
-    from mega import Mega
-except ImportError:
-    Mega = None
 
-SHEET_CREDS_JSON = os.environ.get("SHEET_CREDENTIALS_JSON", "")
-SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
+from playwright.sync_api import sync_playwright
+
 WORKER_ID = os.environ.get("WORKER_ID", "0")
 RUN_ID = os.environ.get("RUN_ID", "local")
 CAPTION_SOURCE = os.environ.get("CAPTION_SOURCE", "filename").strip().lower()
 INTERVAL_MINUTES = float(os.environ.get("INTERVAL_MINUTES", "10"))
 INTERVAL_SECONDS = int(INTERVAL_MINUTES * 60)
 RUN_BUDGET_MINUTES = float(os.environ.get("RUN_BUDGET_MINUTES", "355"))
-MEGA_EMAIL_FALLBACK = os.environ.get("MEGA_EMAIL", "")
-MEGA_PASSWORD_FALLBACK = os.environ.get("MEGA_PASSWORD", "")
-SHEETS_RPM = 55
-SHEETS_WINDOW = 60.0
+RCLONE_REMOTE = os.environ.get("RCLONE_REMOTE", "mega")
+
 MAX_CONSECUTIVE_SESSION_FAILURES = 2
 SESSION_ERROR_KEYWORDS = ("login", "session", "restriction", "graduated-access")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mpeg", ".mpg", ".webm", ".m4v"}
+
 SCREENSHOT_DIR = Path("debug_screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 step_counter = [0]
 
-def dbg(msg):
+
+def dbg(msg: str) -> None:
     print(f"[W{WORKER_ID} {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-def screenshot(page, label):
+
+def screenshot(page, label: str) -> None:
     step_counter[0] += 1
     path = SCREENSHOT_DIR / f"{step_counter[0]:03d}_w{WORKER_ID}_{label}.png"
     try:
@@ -46,208 +51,58 @@ def screenshot(page, label):
     except Exception as e:
         dbg(f" snapshot failed ({label}): {e}")
 
-class RateLimitedSheets:
-    def __init__(self, client, rpm=SHEETS_RPM):
-        self.client = client
-        self.rpm = rpm
-        self._ts = deque()
 
-    def _wait_slot(self):
-        now = time.time()
-        while self._ts and now - self._ts[0] >= SHEETS_WINDOW:
-            self._ts.popleft()
-        if len(self._ts) >= self.rpm:
-            sleep_for = SHEETS_WINDOW - (now - self._ts[0]) + 0.2
-            dbg(f"  [RATE] Sheets {len(self._ts)}/{self.rpm} — sleep {sleep_for:.1f}s")
-            time.sleep(max(0.1, sleep_for))
-            now = time.time()
-            while self._ts and now - self._ts[0] >= SHEETS_WINDOW:
-                self._ts.popleft()
-        self._ts.append(time.time())
+# ── rclone helpers ───────────────────────────────────────────────────────────
+def rclone(*args, check=True) -> subprocess.CompletedProcess:
+    cmd = ["rclone", "--retries", "3", "--low-level-retries", "5", *args]
+    dbg(f" rclone {' '.join(args[:6])}...")
+    return subprocess.run(cmd, capture_output=True, text=True, check=check)
 
-    def _call(self, fn, *args, **kwargs):
-        for attempt in range(1, 15):
-            self._wait_slot()
-            try:
-                return fn(*args, **kwargs)
-            except gspread.exceptions.APIError as e:
-                resp = getattr(e, "response", None)
-                code = resp.status_code if resp is not None else 0
-                if code == 429 or "RATE_LIMIT" in str(e) or "Quota exceeded" in str(e):
-                    wait = 60.0 - (time.time() % 60) + 1.5
-                    dbg(f"  [RATE] 429 — wait {wait:.1f}s until minute completes (try {attempt})")
-                    time.sleep(wait)
-                    self._ts.clear()
-                    continue
-                raise
-        raise RuntimeError("Sheets rate-limit retries exhausted")
 
-    def open_by_key(self, key):
-        return self._call(self.client.open_by_key, key)
-    def worksheet(self, sh, title):
-        return self._call(sh.worksheet, title)
-    def get_all_records(self, ws):
-        return self._call(ws.get_all_records)
-    def get_all_values(self, ws):
-        return self._call(ws.get_all_values)
-    def update_cell(self, ws, row, col, value):
-        return self._call(ws.update_cell, row, col, value)
-    def delete_rows(self, ws, row):
-        return self._call(ws.delete_rows, row)
-
-def build_creds(creds_json_str, scopes):
-    if not creds_json_str.strip():
-        sys.exit("SHEET_CREDENTIALS_JSON empty")
-    data = json.loads(creds_json_str)
-    if data.get("type") == "service_account":
-        return SACredentials.from_service_account_info(data, scopes=scopes)
-    return UserCredentials(
-        token=data.get("token"), refresh_token=data.get("refresh_token"),
-        token_uri=data.get("token_uri", "https://oauth2.googleapis.com/token"),
-        client_id=data.get("client_id"), client_secret=data.get("client_secret"),
-        scopes=data.get("scopes", scopes),
-    )
-
-def _header_index(headers, name):
-    name_l = name.lower()
-    for i, h in enumerate(headers):
-        if h.strip().lower() == name_l:
-            return i
-    raise KeyError(name)
-
-def claim_next_job(rl, lock_ws):
-    values = rl.get_all_values(lock_ws)
-    if not values or len(values) < 2:
-        return None
-    headers = [h.strip() for h in values[0]]
+def rclone_list_files(folder: str, kind: str) -> list[str]:
+    """List file names in mega:folder (non-recursive)."""
+    remote = f"{RCLONE_REMOTE}:{folder}"
     try:
-        idx_run = _header_index(headers, "run_id")
-        idx_status = _header_index(headers, "status")
-        idx_claimed_by = _header_index(headers, "claimed_by")
-        idx_claimed_at = _header_index(headers, "claimed_at")
-    except KeyError as e:
-        dbg(f"LockQueue missing column: {e}")
-        return None
-    for row_num, row in enumerate(values[1:], start=2):
-        while len(row) < len(headers):
-            row.append("")
-        if row[idx_run] != RUN_ID:
-            continue
-        if row[idx_status].strip().lower() != "available":
-            continue
-        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        try:
-            rl.update_cell(lock_ws, row_num, idx_status + 1, "claimed")
-            rl.update_cell(lock_ws, row_num, idx_claimed_by + 1, f"worker-{WORKER_ID}")
-            rl.update_cell(lock_ws, row_num, idx_claimed_at + 1, now_iso)
-        except Exception as e:
-            dbg(f"Claim write failed row {row_num}: {e}")
-            continue
-        time.sleep(0.3)
-        confirm = rl.get_all_values(lock_ws)
-        if row_num - 1 >= len(confirm):
-            continue
-        conf_row = confirm[row_num - 1]
-        while len(conf_row) < len(headers):
-            conf_row.append("")
-        if conf_row[idx_status].strip().lower() != "claimed":
-            continue
-        if conf_row[idx_claimed_by].strip() != f"worker-{WORKER_ID}":
-            dbg(f"Row {row_num} claimed by someone else — skip")
-            continue
-        job = {headers[i]: conf_row[i] if i < len(conf_row) else "" for i in range(len(headers))}
-        job["_row_number"] = row_num
-        dbg(f"Claimed lock_id={job.get('lock_id')} kind={job.get('kind')} file={job.get('file_name')}")
-        return job
-    return None
-
-def mark_job(rl, lock_ws, job, result, tweet_id="", error=""):
-    row_num = job["_row_number"]
-    values = rl.get_all_values(lock_ws)
-    headers = [h.strip() for h in values[0]]
-    updates = {
-        "status": "posted" if result == "SUCCESS" else "failed",
-        "result": result, "tweet_id": tweet_id or "", "error": (error or "")[:500],
-    }
-    for col_name, val in updates.items():
-        try:
-            col = _header_index(headers, col_name) + 1
-            rl.update_cell(lock_ws, row_num, col, val)
-        except Exception as e:
-            dbg(f"mark_job {col_name} failed: {e}")
-
-def mega_login(email, password):
-    if Mega is None:
-        sys.exit("mega.py not installed")
-    if not email or not password:
-        sys.exit("mega credentials missing")
-    dbg(f"Logging into mega.nz as {email[:3]}***")
-    m = Mega()
-    return m.login(email, password)
-
-def mega_find_folder(m, folder_name):
-    found = m.find(folder_name, exclude_deleted=True)
-    if not found:
-        files = m.get_files()
-        for h, meta in files.items():
-            if meta.get("a", {}).get("n") == folder_name and meta.get("t") == 1:
-                return h
-        raise RuntimeError(f"mega folder not found: {folder_name!r}")
-    if isinstance(found, list):
-        return found[0]
-    return found[0] if isinstance(found, tuple) else found
-
-def mega_list_in_folder(m, folder_handle, kind):
-    files = m.get_files()
+        r = rclone("lsf", remote, "--files-only", check=False)
+    except Exception as e:
+        dbg(f"rclone lsf error: {e}")
+        return []
+    if r.returncode != 0:
+        dbg(f"rclone lsf stderr: {r.stderr[:300]}")
+        return []
+    names = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
     out = []
-    for h, meta in files.items():
-        if meta.get("t") != 0:
-            continue
-        if meta.get("p") != folder_handle:
-            continue
-        name = meta.get("a", {}).get("n", "")
-        if not name:
-            continue
-        ext = Path(name).suffix.lower()
-        if kind == "image" and ext not in IMAGE_EXTS:
-            continue
-        if kind == "video" and ext not in VIDEO_EXTS:
-            continue
-        out.append({"handle": h, "name": name, "meta": meta})
+    for n in names:
+        ext = Path(n).suffix.lower()
+        if kind == "image" and ext in IMAGE_EXTS:
+            out.append(n)
+        elif kind == "video" and ext in VIDEO_EXTS:
+            out.append(n)
     return out
 
-def mega_download_by_name(m, folder_handle, file_name, dest_dir):
-    files = mega_list_in_folder(m, folder_handle, "image") + mega_list_in_folder(m, folder_handle, "video")
-    target = None
-    for f in files:
-        if f["name"] == file_name or f["name"].lower() == file_name.lower():
-            target = f
-            break
-    if target is None:
-        found = m.find(file_name, exclude_deleted=True)
-        if found:
-            target = {"handle": found[0] if isinstance(found, (list, tuple)) else found, "name": file_name}
-        else:
-            raise RuntimeError(f"File {file_name!r} not found in mega source")
-    dest_dir_path = Path(dest_dir)
-    dest_dir_path.mkdir(parents=True, exist_ok=True)
-    m.download(target["handle"], str(dest_dir_path) + os.sep)
-    local = dest_dir_path / target["name"]
-    if not local.exists():
-        cwd_file = Path(target["name"])
-        if cwd_file.exists():
-            cwd_file.rename(local)
-    if not local.exists():
-        raise RuntimeError(f"Download finished but file missing: {local}")
+
+def rclone_download(folder: str, file_name: str, dest_dir: str) -> str:
+    remote = f"{RCLONE_REMOTE}:{folder}/{file_name}"
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    local = dest / file_name
+    r = rclone("copyto", remote, str(local), check=False)
+    if r.returncode != 0 or not local.exists():
+        raise RuntimeError(f"rclone download failed: {r.stderr[:400]}")
     return str(local)
 
-def mega_move_to_claimed(m, file_handle, claimed_folder_handle, file_name):
-    try:
-        m.move(file_handle, claimed_folder_handle)
-        dbg(f" Moved '{file_name}' to claimed folder")
-    except Exception as e:
-        dbg(f" move failed for '{file_name}': {e}")
 
+def rclone_move_to_claimed(source_folder: str, claimed_folder: str, file_name: str) -> None:
+    src = f"{RCLONE_REMOTE}:{source_folder}/{file_name}"
+    dst = f"{RCLONE_REMOTE}:{claimed_folder}/{file_name}"
+    r = rclone("moveto", src, dst, check=False)
+    if r.returncode != 0:
+        dbg(f" rclone move warning: {r.stderr[:300]}")
+    else:
+        dbg(f" Moved {file_name} -> {claimed_folder}")
+
+
+# ── Playwright / X ───────────────────────────────────────────────────────────
 TEXTBOX_SELECTORS = [
     '[data-testid="tweetTextarea_0"]',
     '[data-testid="tweetTextarea_0EditorContainer"] div[contenteditable="true"]',
@@ -266,16 +121,18 @@ PREVIEW_SELECTORS = [
     '[data-testid="attachments"]', 'img[src*="blob:"]', 'video[src*="blob:"]',
 ]
 
+
 def find_element_multi(page, selectors, label, timeout=15000):
     for sel in selectors:
         try:
             el = page.locator(sel).first
-            el.wait_for(state="visible", timeout=timeout // len(selectors))
+            el.wait_for(state="visible", timeout=timeout // max(len(selectors), 1))
             dbg(f" Found {label}: {sel}")
             return el
         except Exception:
             pass
     return None
+
 
 def _textbox_visible(page):
     for sel in TEXTBOX_SELECTORS[:3]:
@@ -286,6 +143,7 @@ def _textbox_visible(page):
             pass
     return False
 
+
 def _is_genuinely_logged_out(page):
     try:
         page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=20000)
@@ -294,12 +152,15 @@ def _is_genuinely_logged_out(page):
         if "login" in current or "signin" in current or "graduated-access" in current:
             return True
         try:
-            page.locator('[data-testid="AppTabBar_Home_Link"], [data-testid="SideNav_NewTweet_Button"]').first.wait_for(state="visible", timeout=8000)
+            page.locator(
+                '[data-testid="AppTabBar_Home_Link"], [data-testid="SideNav_NewTweet_Button"]'
+            ).first.wait_for(state="visible", timeout=8000)
             return False
         except Exception:
             return True
     except Exception:
         return True
+
 
 def navigate_to_compose(page, post_index, attempt=1):
     for url in ["https://x.com/compose/post", "https://twitter.com/compose/tweet"]:
@@ -322,7 +183,9 @@ def navigate_to_compose(page, post_index, attempt=1):
     try:
         page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(3000)
-        btn = page.locator('a[href="/compose/post"], [data-testid="SideNav_NewTweet_Button"], [aria-label="Post"]').first
+        btn = page.locator(
+            'a[href="/compose/post"], [data-testid="SideNav_NewTweet_Button"], [aria-label="Post"]'
+        ).first
         btn.wait_for(state="visible", timeout=10000)
         btn.click()
         page.wait_for_timeout(3000)
@@ -332,6 +195,7 @@ def navigate_to_compose(page, post_index, attempt=1):
         dbg(f" [NAV] home fallback: {e}")
     return False
 
+
 def type_into_textbox(page, locator, text):
     locator.scroll_into_view_if_needed()
     locator.click()
@@ -339,10 +203,11 @@ def type_into_textbox(page, locator, text):
     page.keyboard.type(text, delay=15)
     page.wait_for_timeout(400)
 
+
 def _wait_for_preview(page, timeout, post_index, label):
     for sel in PREVIEW_SELECTORS:
         try:
-            page.wait_for_selector(sel, timeout=timeout // len(PREVIEW_SELECTORS))
+            page.wait_for_selector(sel, timeout=timeout // max(len(PREVIEW_SELECTORS), 1))
             try:
                 page.wait_for_selector('[role="progressbar"]', state="detached", timeout=timeout)
             except Exception:
@@ -354,6 +219,7 @@ def _wait_for_preview(page, timeout, post_index, label):
             continue
     return False
 
+
 def attach_media_robust(page, media_path, is_video, post_index):
     upload_timeout = 120000 if is_video else 45000
     file_inputs = page.locator('input[type="file"]')
@@ -363,7 +229,9 @@ def attach_media_robust(page, media_path, is_video, post_index):
         for idx in range(count):
             inp = file_inputs.nth(idx)
             accept = inp.get_attribute("accept") or ""
-            if (is_video and ("video" in accept or accept == "")) or (not is_video and ("image" in accept or accept == "")):
+            if (is_video and ("video" in accept or accept == "")) or (
+                not is_video and ("image" in accept or accept == "")
+            ):
                 try:
                     inp.set_input_files(media_path)
                     if _wait_for_preview(page, upload_timeout, post_index, f"slot{idx}"):
@@ -393,6 +261,7 @@ def attach_media_robust(page, media_path, is_video, post_index):
     screenshot(page, f"p{post_index}_attach_failed")
     raise RuntimeError("All media attachment strategies failed.")
 
+
 def add_thread_tweet_box(page, post_index, tweet_index):
     btn = find_element_multi(page, ADD_THREAD_TWEET_SELECTORS, "add-thread", timeout=10000)
     if btn is None:
@@ -406,6 +275,7 @@ def add_thread_tweet_box(page, post_index, tweet_index):
     except Exception:
         all_ce = page.locator('div[contenteditable="true"][data-testid]')
         return all_ce.nth(all_ce.count() - 1)
+
 
 def click_post_button(page, post_index):
     post_btn = find_element_multi(page, POST_BUTTON_SELECTORS, "post button", timeout=15000)
@@ -424,8 +294,10 @@ def click_post_button(page, post_index):
             POST_BUTTON_SELECTORS,
         )
 
+
 def post_with_network_confirmation(page, post_index, click_timeout=25000):
     result = {"sent": None, "tweet_id": None}
+
     def on_response(response):
         if "CreateTweet" not in response.url:
             return
@@ -442,6 +314,7 @@ def post_with_network_confirmation(page, post_index, click_timeout=25000):
             result["tweet_id"] = tweet_id
         except (KeyError, TypeError):
             result["sent"] = False
+
     page.on("response", on_response)
     try:
         click_post_button(page, post_index)
@@ -458,6 +331,7 @@ def post_with_network_confirmation(page, post_index, click_timeout=25000):
     if result["sent"]:
         return True, result["tweet_id"]
     return False, None
+
 
 def post_one_job(page, job_payload, post_index, max_attempts=3):
     session_error = False
@@ -476,6 +350,10 @@ def post_one_job(page, job_payload, post_index, max_attempts=3):
             for idx in range(1, len(job_payload["tweets"])):
                 box = add_thread_tweet_box(page, post_index, idx)
                 type_into_textbox(page, box, job_payload["tweets"][idx])
+            # link-preview: X auto-fetches card from URL in text; give it a moment
+            if job_payload["kind"] == "link":
+                page.wait_for_timeout(4000)
+                screenshot(page, f"p{post_index}_link_card")
             sent, tweet_id = post_with_network_confirmation(page, post_index)
             if sent:
                 dbg(f" SUCCESS tweet_id={tweet_id}")
@@ -502,89 +380,44 @@ def post_one_job(page, job_payload, post_index, max_attempts=3):
                 return False, False, None
     return False, session_error, None
 
-def split_into_tweets(text, delimiter):
+
+def split_into_tweets(text: str, delimiter: str) -> list[str]:
     parts = [p.strip() for p in text.split(delimiter)]
     parts = [p for p in parts if p]
     return parts if parts else [text.strip()]
 
-def load_account_map(rl, sh):
-    out = {}
-    try:
-        ws = rl.worksheet(sh, "Accounts")
-        for r in rl.get_all_records(ws):
-            aid = str(r.get("account_id") or r.get("Account") or "").strip()
-            if aid:
-                out[aid] = r
-    except Exception as e:
-        dbg(f"Accounts load: {e}")
-    return out
 
-def load_settings(rl, sh):
-    out = {}
-    try:
-        ws = rl.worksheet(sh, "Settings")
-        for r in rl.get_all_records(ws):
-            k = (r.get("Key") or r.get("key") or r.get("Setting") or "").strip()
-            v = (r.get("Value") or r.get("value") or "").strip()
-            if k:
-                out[k] = v
-    except Exception:
-        pass
-    return out
+def write_storage_state(state_json: str, path: str) -> str:
+    raw = (state_json or "").strip()
+    if not raw:
+        raise RuntimeError("Empty storage_state_json")
+    Path(path).write_text(raw, encoding="utf-8")
+    return path
 
-def write_storage_state(account_row, path):
-    raw = (account_row.get("storage_state_json") or account_row.get("StorageState") or "").strip()
-    if raw:
-        Path(path).write_text(raw, encoding="utf-8")
-        return path
-    env_state = os.environ.get("X_STORAGE_STATE_JSON", "")
-    if env_state:
-        Path(path).write_text(env_state, encoding="utf-8")
-        return path
-    if Path("x_storage_state.json").exists():
-        return "x_storage_state.json"
-    raise RuntimeError(f"No storage state for account {account_row.get('account_id')}")
 
 def main():
     run_start = time.time()
     run_deadline = run_start + RUN_BUDGET_MINUTES * 60
     dbg("=" * 60)
-    dbg(f"Worker {WORKER_ID} starting  RUN_ID={RUN_ID}")
+    dbg(f"Worker {WORKER_ID} starting RUN_ID={RUN_ID}")
     dbg("=" * 60)
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = build_creds(SHEET_CREDS_JSON, scopes)
-    rl = RateLimitedSheets(gspread.authorize(creds))
-    sh = rl.open_by_key(SPREADSHEET_ID)
-    lock_ws = rl.worksheet(sh, "LockQueue")
-    settings = load_settings(rl, sh)
-    accounts = load_account_map(rl, sh)
-
-    mega_source_name = settings.get("mega_source_folder", "Source")
-    mega_claimed_name = settings.get("mega_claimed_folder", "Claimed")
+    plan_path = Path("job_plan.json")
+    if not plan_path.exists():
+        sys.exit("job_plan.json missing — download-artifact step failed?")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    settings = plan.get("settings") or {}
+    mega_source = settings.get("mega_source_folder", "Source")
+    mega_claimed = settings.get("mega_claimed_folder", "Claimed")
     thread_delimiter = settings.get("thread_delimiter", "---")
 
-    mega_email = MEGA_EMAIL_FALLBACK
-    mega_password = MEGA_PASSWORD_FALLBACK
-    for acc in accounts.values():
-        if acc.get("mega_email") and acc.get("mega_password"):
-            mega_email = acc["mega_email"]
-            mega_password = acc["mega_password"]
-            break
-    m = source_handle = claimed_handle = None
-    try:
-        m = mega_login(mega_email, mega_password)
-        source_handle = mega_find_folder(m, mega_source_name)
-        claimed_handle = mega_find_folder(m, mega_claimed_name)
-        dbg(f"mega source={mega_source_name} claimed={mega_claimed_name}")
-    except Exception as e:
-        dbg(f"mega login/folder setup failed: {e} — image/video jobs may fail")
+    my_jobs = (plan.get("workers") or {}).get(str(WORKER_ID)) or []
+    dbg(f"Assigned {len(my_jobs)} job(s)")
+    if not my_jobs:
+        dbg("Nothing to do")
+        return
 
     consecutive_session_failures = 0
-    posts_done = 0
     results = []
 
     with sync_playwright() as p:
@@ -593,39 +426,38 @@ def main():
             args=["--no-sandbox", "--disable-setuid-sandbox",
                   "--disable-blink-features=AutomationControlled"],
         )
+        context = None
         page = None
         current_account_id = None
-        context = None
 
-        while time.time() < run_deadline:
-            job = claim_next_job(rl, lock_ws)
-            if job is None:
-                dbg("No more available jobs for this RUN_ID — worker exiting.")
+        for i, job in enumerate(my_jobs, start=1):
+            if time.time() >= run_deadline:
+                dbg("Budget exhausted — stopping")
                 break
 
-            posts_done += 1
             kind = job.get("kind", "").lower()
             account_id = job.get("account_id", "default")
-            dbg(f"{'='*50}")
-            dbg(f"POST #{posts_done} kind={kind} account={account_id} lock={job.get('lock_id')}")
-            dbg(f"{'='*50}")
+            dbg(f"{'=' * 50}")
+            dbg(f"POST {i}/{len(my_jobs)} kind={kind} account={account_id}")
+            dbg(f"{'=' * 50}")
 
             if account_id != current_account_id or context is None:
                 if context:
                     context.close()
-                acc_row = accounts.get(account_id, {})
                 state_path = f"x_state_w{WORKER_ID}_{account_id}.json"
                 try:
-                    write_storage_state(acc_row, state_path)
+                    write_storage_state(job.get("storage_state_json", ""), state_path)
                 except Exception as e:
                     dbg(f"Storage state error: {e}")
-                    mark_job(rl, lock_ws, job, "FAILED", error=str(e))
+                    results.append((i, kind, f"FAILED: {e}"))
                     continue
                 context = browser.new_context(
                     storage_state=state_path,
                     viewport={"width": 1280, "height": 900},
-                    user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+                    user_agent=(
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    ),
                 )
                 context.add_init_script(
                     "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
@@ -634,101 +466,83 @@ def main():
                 current_account_id = account_id
 
             media_path = None
-            tmp_to_clean = None
-            tweets = []
-            file_handle = None
-            file_name = job.get("file_name", "")
+            tmp_dir = None
+            tweets: list[str] = []
+            file_name = job.get("file_name") or ""
 
             try:
                 if kind in ("image", "video"):
-                    caption = (job.get("caption_text") or "").strip()
-                    if not caption:
-                        caption = file_name or " "
+                    caption = (job.get("caption_text") or "").strip() or file_name or " "
                     tweets = [caption]
-                    if not m or source_handle is None:
-                        raise RuntimeError("mega not available")
                     if not file_name:
-                        listing = mega_list_in_folder(m, source_handle, kind)
+                        listing = rclone_list_files(mega_source, kind)
                         if not listing:
-                            raise RuntimeError(f"No {kind} files left in mega source folder")
-                        pick = random.choice(listing)
-                        file_name = pick["name"]
-                        file_handle = pick["handle"]
-                        try:
-                            headers = [h.strip() for h in rl.get_all_values(lock_ws)[0]]
-                            col = _header_index(headers, "file_name") + 1
-                            rl.update_cell(lock_ws, job["_row_number"], col, file_name)
-                        except Exception:
-                            pass
-                    dest_dir = tempfile.mkdtemp(prefix="mega_")
-                    media_path = mega_download_by_name(m, source_handle, file_name, dest_dir)
-                    tmp_to_clean = media_path
-                    if file_handle is None:
-                        listing = mega_list_in_folder(m, source_handle, kind)
-                        for f in listing:
-                            if f["name"] == file_name:
-                                file_handle = f["handle"]
-                                break
-                else:
-                    text = job.get("caption_text") or ""
-                    if not text and job.get("thread_row"):
-                        try:
-                            thr = rl.worksheet(sh, "Threads")
-                            vals = rl.get_all_values(thr)
-                            ridx = int(job["thread_row"]) - 1
-                            if 0 <= ridx < len(vals):
-                                text = " ".join(c for c in vals[ridx] if c).strip()
-                        except Exception as e:
-                            dbg(f"thread re-read: {e}")
+                            raise RuntimeError(f"No {kind} files in mega:{mega_source}")
+                        file_name = random.choice(listing)
+                        job["file_name"] = file_name
+                        dbg(f"Picked live file: {file_name}")
+                    tmp_dir = tempfile.mkdtemp(prefix="rclone_")
+                    media_path = rclone_download(mega_source, file_name, tmp_dir)
+
+                elif kind == "thread":
+                    text = job.get("text") or job.get("caption_text") or ""
                     tweets = split_into_tweets(text, thread_delimiter)
 
+                elif kind == "link":
+                    # caption + optional hashtags + URL (X generates social card)
+                    text = (job.get("caption_text") or "").strip()
+                    if not text:
+                        parts = []
+                        if job.get("caption"):
+                            parts.append(job["caption"])
+                        if job.get("hashtags"):
+                            parts.append(job["hashtags"])
+                        parts.append(job.get("url") or "")
+                        text = "\n\n".join(p for p in parts if p)
+                    tweets = [text]
+
+                else:
+                    raise RuntimeError(f"Unknown kind: {kind}")
+
                 for j, t in enumerate(tweets, 1):
-                    dbg(f" Tweet {j}: {t[:80]}{'...' if len(t) > 80 else ''}")
+                    dbg(f" Tweet {j}: {t[:90]}{'...' if len(t) > 90 else ''}")
 
                 payload = {"kind": kind, "tweets": tweets, "media_path": media_path}
-                posted, session_err, tweet_id = post_one_job(page, payload, post_index=posts_done)
+                posted, session_err, tweet_id = post_one_job(page, payload, post_index=i)
 
                 if posted:
-                    mark_job(rl, lock_ws, job, "SUCCESS", tweet_id=tweet_id or "")
-                    results.append((posts_done, kind, "SUCCESS"))
+                    results.append((i, kind, "SUCCESS"))
                     consecutive_session_failures = 0
-                    if kind in ("image", "video") and m and file_handle and claimed_handle:
-                        mega_move_to_claimed(m, file_handle, claimed_handle, file_name)
-                    if kind == "thread" and job.get("thread_row"):
-                        try:
-                            thr = rl.worksheet(sh, "Threads")
-                            rl.delete_rows(thr, int(job["thread_row"]))
-                        except Exception as e:
-                            dbg(f"thread row delete: {e}")
+                    if kind in ("image", "video") and file_name:
+                        rclone_move_to_claimed(mega_source, mega_claimed, file_name)
                 elif session_err:
                     consecutive_session_failures += 1
-                    mark_job(rl, lock_ws, job, "FAILED", error="session")
-                    results.append((posts_done, kind, "FAILED (session)"))
+                    results.append((i, kind, "FAILED (session)"))
                     if consecutive_session_failures >= MAX_CONSECUTIVE_SESSION_FAILURES:
-                        dbg("Too many consecutive session failures — stopping worker")
+                        dbg("Too many session failures — stopping worker")
                         break
                 else:
-                    mark_job(rl, lock_ws, job, "FAILED", error="post failed after retries")
-                    results.append((posts_done, kind, "FAILED"))
+                    results.append((i, kind, "FAILED"))
                     consecutive_session_failures = 0
 
             except Exception as e:
                 dbg(f"EXCEPTION: {e}")
-                mark_job(rl, lock_ws, job, "FAILED", error=str(e)[:500])
-                results.append((posts_done, kind, f"EXCEPTION: {e}"))
+                results.append((i, kind, f"EXCEPTION: {e}"))
             finally:
-                if tmp_to_clean:
+                if tmp_dir:
                     try:
-                        Path(tmp_to_clean).unlink(missing_ok=True)
-                        Path(tmp_to_clean).parent.rmdir()
+                        for f in Path(tmp_dir).iterdir():
+                            f.unlink(missing_ok=True)
+                        Path(tmp_dir).rmdir()
                     except Exception:
                         pass
 
-            if time.time() + INTERVAL_SECONDS >= run_deadline:
-                dbg("Next sleep would exceed budget — stopping")
-                break
-            dbg(f"Sleeping {INTERVAL_SECONDS}s before next claim...")
-            time.sleep(INTERVAL_SECONDS)
+            if i < len(my_jobs):
+                if time.time() + INTERVAL_SECONDS >= run_deadline:
+                    dbg("Next sleep would exceed budget — stopping")
+                    break
+                dbg(f"Sleeping {INTERVAL_SECONDS}s...")
+                time.sleep(INTERVAL_SECONDS)
 
         if context:
             context.close()
@@ -736,11 +550,12 @@ def main():
 
     dbg("")
     dbg("=" * 60)
-    dbg(f"Worker {WORKER_ID} complete. Summary:")
+    dbg(f"Worker {WORKER_ID} complete:")
     for idx, kind, status in results:
         dbg(f"  Post {idx:>2} [{kind:<6}]: {status}")
-    dbg(f"Total run time: {(time.time() - run_start) / 60:.1f} min")
+    dbg(f"Runtime: {(time.time() - run_start) / 60:.1f} min")
     dbg("=" * 60)
+
 
 if __name__ == "__main__":
     main()
