@@ -350,9 +350,29 @@ def post_one_job(page, job_payload, post_index, max_attempts=3):
             for idx in range(1, len(job_payload["tweets"])):
                 box = add_thread_tweet_box(page, post_index, idx)
                 type_into_textbox(page, box, job_payload["tweets"][idx])
-            # link-preview: X auto-fetches card from URL in text; give it a moment
+            # link-preview: wait for social card or enabled Post button
             if job_payload["kind"] == "link":
-                page.wait_for_timeout(4000)
+                card_sels = [
+                    '[data-testid="card.wrapper"]',
+                    '[data-testid="card.layoutLarge.media"]',
+                    '[data-testid="card.layoutSmall.media"]',
+                    'div[data-testid="card.wrapper"]',
+                    'a[href][rel="noopener noreferrer"]',
+                ]
+                card_ok = False
+                for sel in card_sels:
+                    try:
+                        page.wait_for_selector(sel, timeout=8_000)
+                        card_ok = True
+                        dbg(f" Link card appeared via {sel}")
+                        break
+                    except Exception:
+                        continue
+                if not card_ok:
+                    dbg(" Link card not detected — waiting extra 5s before post")
+                    page.wait_for_timeout(5_000)
+                else:
+                    page.wait_for_timeout(1_500)
                 screenshot(page, f"p{post_index}_link_card")
             sent, tweet_id = post_with_network_confirmation(page, post_index)
             if sent:
@@ -388,10 +408,25 @@ def split_into_tweets(text: str, delimiter: str) -> list[str]:
 
 
 def write_storage_state(state_json: str, path: str) -> str:
-    raw = (state_json or "").strip()
-    if not raw:
+    import json as _json
+    raw = state_json
+    if raw is None:
         raise RuntimeError("Empty storage_state_json")
-    Path(path).write_text(raw, encoding="utf-8")
+    if isinstance(raw, dict):
+        data = raw
+    else:
+        raw = str(raw).strip()
+        if not raw:
+            raise RuntimeError("Empty storage_state_json")
+        try:
+            data = _json.loads(raw)
+        except _json.JSONDecodeError as e:
+            raise RuntimeError(f"storage_state_json is not valid JSON: {e}") from e
+    cookies = data.get("cookies") or []
+    names = {c.get("name") for c in cookies if isinstance(c, dict)}
+    if "auth_token" not in names and "auth_token" not in str(cookies):
+        dbg("WARNING: storage_state has no auth_token cookie — may not be logged in")
+    Path(path).write_text(_json.dumps(data), encoding="utf-8")
     return path
 
 
@@ -445,8 +480,15 @@ def main():
                 if context:
                     context.close()
                 state_path = f"x_state_w{WORKER_ID}_{account_id}.json"
+                # Prefer per-job state, else look up from plan accounts list
+                state_raw = job.get("storage_state_json") or ""
+                if not state_raw:
+                    for acc in (plan.get("accounts") or []):
+                        if str(acc.get("account_id")) == str(account_id):
+                            state_raw = acc.get("storage_state_json") or ""
+                            break
                 try:
-                    write_storage_state(job.get("storage_state_json", ""), state_path)
+                    write_storage_state(state_raw, state_path)
                 except Exception as e:
                     dbg(f"Storage state error: {e}")
                     results.append((i, kind, f"FAILED: {e}"))
@@ -464,6 +506,22 @@ def main():
                 )
                 page = context.new_page()
                 current_account_id = account_id
+                # Warm session: open home and confirm we are logged in
+                try:
+                    page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30_000)
+                    page.wait_for_timeout(3_000)
+                    cur = page.url
+                    dbg(f" Session check URL: {cur}")
+                    screenshot(page, f"session_check_{account_id}")
+                    if "login" in cur or "i/flow" in cur:
+                        raise RuntimeError(
+                            f"Not logged in after loading storage_state (url={cur}). "
+                            "Re-export storage_state_json while logged into x.com."
+                        )
+                except RuntimeError:
+                    raise
+                except Exception as e:
+                    dbg(f" Session warm-up warning: {e}")
 
             media_path = None
             tmp_dir = None
@@ -493,13 +551,22 @@ def main():
                     text = (job.get("caption_text") or "").strip()
                     if not text:
                         parts = []
-                        if job.get("caption"):
-                            parts.append(job["caption"])
-                        if job.get("hashtags"):
-                            parts.append(job["hashtags"])
-                        parts.append(job.get("url") or "")
-                        text = "\n\n".join(p for p in parts if p)
+                        if (job.get("caption") or "").strip():
+                            parts.append(job["caption"].strip())
+                        if (job.get("hashtags") or "").strip():
+                            parts.append(job["hashtags"].strip())
+                        url = (job.get("url") or "").strip()
+                        if url:
+                            parts.append(url)
+                        text = "\n\n".join(parts)
+                    if not text.strip():
+                        raise RuntimeError("Link job has empty url/caption — nothing to post")
+                    # Ensure URL is present for card generation
+                    url = (job.get("url") or "").strip()
+                    if url and url not in text:
+                        text = text.rstrip() + "\n\n" + url
                     tweets = [text]
+                    dbg(f" Link post text length={len(text)} url={url[:60]}")
 
                 else:
                     raise RuntimeError(f"Unknown kind: {kind}")
