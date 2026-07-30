@@ -39,7 +39,7 @@ RUN_ID = os.environ.get("RUN_ID", "local")
 MEGA_SOURCE_OVERRIDE = os.environ.get("MEGA_SOURCE_FOLDER_OVERRIDE", "").strip()
 MEGA_CLAIMED_OVERRIDE = os.environ.get("MEGA_CLAIMED_FOLDER_OVERRIDE", "").strip()
 UNLOCK_STALE_HOURS = float(os.environ.get("UNLOCK_STALE_HOURS", "6"))
-GOOGLE_OAUTH_PATH = os.environ.get("GOOGLE_OAUTH_PATH", "google_oauth.json")
+GOOGLE_CREDS_PATH = os.environ.get("GOOGLE_CREDS_PATH") or os.environ.get("GOOGLE_OAUTH_PATH") or "google_creds.json"
 
 
 def dbg(msg: str) -> None:
@@ -101,29 +101,81 @@ class RateLimitedSheets:
         return self._call(ws.row_values, row)
 
 
-def build_oauth_client(path: str) -> gspread.Client:
-    if not Path(path).exists():
-        sys.exit(f"GOOGLE_OAUTH_PATH not found: {path}")
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    needed = {
+
+def load_google_creds(path: str):
+    """Load service-account (preferred) or user-OAuth credentials from JSON file."""
+    from datetime import datetime, timezone
+    from google.oauth2.credentials import Credentials
+    from google.oauth2.service_account import Credentials as SACredentials
+    from google.auth.transport.requests import Request
+    from google.auth.exceptions import RefreshError
+
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"Credentials file not found: {path}")
+    raw = p.read_text(encoding="utf-8").strip()
+    if not raw:
+        raise SystemExit(
+            "Credentials file is EMPTY. Set secret GOOGLE_SERVICE_ACCOUNT_JSON "
+            "to your full service-account JSON (type/private_key/client_email)."
+        )
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"Credentials JSON invalid: {e}")
+
+    scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
-    }
+    ]
+
+    if data.get("type") == "service_account":
+        dbg(f"Using service account: {data.get('client_email')}")
+        return SACredentials.from_service_account_info(data, scopes=scopes)
+
+    # Legacy user OAuth path
+    required = ["client_id", "client_secret", "refresh_token", "token_uri"]
+    missing = [k for k in required if not (data.get(k) or "").strip()]
+    if missing:
+        raise SystemExit(
+            "Not service_account and OAuth missing: "
+            + ", ".join(missing)
+            + ". Use the working service-account JSON (type=service_account)."
+        )
+    needed = set(scopes)
     scopes = list(set(data.get("scopes") or []) | needed)
+    expiry = None
+    exp_raw = data.get("expiry") or data.get("expires_at")
+    if exp_raw:
+        try:
+            s = str(exp_raw).replace("Z", "+00:00")
+            expiry = datetime.fromisoformat(s)
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+        except Exception:
+            expiry = None
     creds = Credentials(
-        token=data.get("token"),
+        token=data.get("token") or None,
         refresh_token=data.get("refresh_token"),
         token_uri=data.get("token_uri", "https://oauth2.googleapis.com/token"),
         client_id=data.get("client_id"),
         client_secret=data.get("client_secret"),
         scopes=scopes,
+        expiry=expiry,
     )
-    if (not creds.valid) and creds.refresh_token:
+    if not creds.valid:
         try:
             creds.refresh(Request())
-            dbg("OAuth token refreshed")
-        except Exception as e:
-            dbg(f"Token refresh warning: {e}")
+            dbg("OAuth access token refreshed OK")
+        except RefreshError as e:
+            raise SystemExit(
+                f"OAuth refresh failed: {e}. Prefer service-account JSON instead."
+            ) from e
+    return creds
+
+
+def build_oauth_client(path: str):
+    creds = load_google_creds(path)
     return gspread.authorize(creds)
 
 
@@ -410,7 +462,7 @@ def main():
     dbg(f"POST_COUNT={POST_COUNT} PARALLEL={PARALLEL_JOBS} CAPTION_SOURCE={CAPTION_SOURCE}")
     dbg("=" * 60)
 
-    rl = RateLimitedSheets(build_oauth_client(GOOGLE_OAUTH_PATH))
+    rl = RateLimitedSheets(build_oauth_client(GOOGLE_CREDS_PATH))
     sh = rl.open_by_key(SPREADSHEET_ID)
 
     settings = load_settings(rl, sh)
