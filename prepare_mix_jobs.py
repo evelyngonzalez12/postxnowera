@@ -423,6 +423,27 @@ def load_urls(rl, sh) -> list[dict]:
     return out
 
 
+def _looks_like_media_filename(name: str) -> bool:
+    """Reject sheet notes / headers mistaken for file names."""
+    if not name or len(name) > 180:
+        return False
+    lower = name.lower().strip()
+    if lower.startswith("optional") or "workers list" in lower or "mega_node" in lower:
+        return False
+    if " " in name and "." not in Path(name).suffix:
+        # notes often have spaces and no extension
+        if not any(lower.endswith(ext) for ext in (
+            ".jpg", ".jpeg", ".png", ".gif", ".webp",
+            ".mp4", ".mov", ".avi", ".mpeg", ".mpg", ".webm", ".m4v",
+        )):
+            return False
+    ext = Path(name).suffix.lower()
+    return ext in {
+        ".jpg", ".jpeg", ".png", ".gif", ".webp",
+        ".mp4", ".mov", ".avi", ".mpeg", ".mpg", ".webm", ".m4v",
+    }
+
+
 def load_media(rl, sh):
     images, videos = [], []
     try:
@@ -432,14 +453,17 @@ def load_media(rl, sh):
             if status not in ("available", "", "ready"):
                 continue
             name = (r.get("file_name") or r.get("filename") or r.get("name") or "").strip()
-            if not name:
+            if not _looks_like_media_filename(name):
+                if name:
+                    dbg(f"Skip MediaInventory entry (not a media file): {name[:80]!r}")
                 continue
             kind = str(r.get("kind") or r.get("type") or "").lower()
             entry = {"file_name": name, "kind": kind}
-            if kind == "video" or name.lower().endswith((".mp4", ".mov", ".avi", ".mpeg", ".webm", ".m4v")):
+            if kind == "video" or name.lower().endswith((".mp4", ".mov", ".avi", ".mpeg", ".mpg", ".webm", ".m4v")):
                 videos.append(entry)
             else:
                 images.append(entry)
+        dbg(f"MediaInventory usable: images={len(images)} videos={len(videos)}")
     except Exception as e:
         dbg(f"MediaInventory: {e}")
     return images, videos
