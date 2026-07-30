@@ -33,6 +33,16 @@ SESSION_ERROR_KEYWORDS = ("login", "session", "restriction", "graduated-access")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mpeg", ".mpg", ".webm", ".m4v"}
 
+
+def looks_like_media_filename(name: str) -> bool:
+    if not name or len(name) > 180:
+        return False
+    lower = name.lower()
+    if lower.startswith("optional") or "workers list" in lower or "mega_node" in lower:
+        return False
+    ext = Path(name).suffix.lower()
+    return ext in IMAGE_EXTS | VIDEO_EXTS
+
 SCREENSHOT_DIR = Path("debug_screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 step_counter = [0]
@@ -530,17 +540,34 @@ def main():
 
             try:
                 if kind in ("image", "video"):
-                    caption = (job.get("caption_text") or "").strip() or file_name or " "
+                    caption = (job.get("caption_text") or "").strip() or " "
                     tweets = [caption]
+                    # Ignore sheet notes / bad names; list live from mega folder
+                    if not looks_like_media_filename(file_name):
+                        dbg(f"Invalid/missing file_name {file_name!r} — listing mega:{mega_source}")
+                        file_name = ""
                     if not file_name:
                         listing = rclone_list_files(mega_source, kind)
                         if not listing:
-                            raise RuntimeError(f"No {kind} files in mega:{mega_source}")
+                            raise RuntimeError(
+                                f"No {kind} files in mega:{mega_source}. "
+                                f"Check MEGA_RCLONE_CONF and Settings mega_source_folder={mega_source!r}"
+                            )
                         file_name = random.choice(listing)
                         job["file_name"] = file_name
                         dbg(f"Picked live file: {file_name}")
                     tmp_dir = tempfile.mkdtemp(prefix="rclone_")
-                    media_path = rclone_download(mega_source, file_name, tmp_dir)
+                    try:
+                        media_path = rclone_download(mega_source, file_name, tmp_dir)
+                    except Exception as dl_err:
+                        dbg(f"Download failed for {file_name!r}: {dl_err}")
+                        listing = rclone_list_files(mega_source, kind)
+                        if not listing:
+                            raise
+                        file_name = random.choice(listing)
+                        job["file_name"] = file_name
+                        dbg(f"Retry with live file: {file_name}")
+                        media_path = rclone_download(mega_source, file_name, tmp_dir)
 
                 elif kind == "thread":
                     text = job.get("text") or job.get("caption_text") or ""
