@@ -1,7 +1,7 @@
 # ============================================================
 # Post Mix (Images + Videos + Threads + Link Previews) to X
 # Media: mega.nz via rclone | Settings: Google Sheet (OAuth)
-# Secrets: MEGA_RCLONE_CONF + GOOGLE_OAUTH_JSON only
+# Secrets: MEGA_RCLONE_CONF + GOOGLE_SERVICE_ACCOUNT_JSON only
 # ============================================================
 name: Post Mix (Images + Videos + Threads + Links) to X
 
@@ -50,7 +50,7 @@ on:
       spreadsheet_id:
         description: "Google Sheet ID"
         required: false
-        default: "1QXCzLY_ygvJlCxdgDyh_oYkBxm5jSfDp56jtYQ1FVYw"
+        default: "1x4MblJlEV-HlQi_2JzOhvo5MSH2u6koOvnmtyql0DDo"
       mega_source_folder:
         description: "mega source folder name (override Settings tab)"
         required: false
@@ -89,13 +89,14 @@ jobs:
 
       - name: Write Google OAuth credentials
         env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
         run: python check_oauth_secret.py
 
       - name: Plan work (dynamic locks, no LockQueue sheet)
         id: plan
         env:
-          GOOGLE_OAUTH_PATH: google_oauth.json
+          GOOGLE_CREDS_PATH: google_creds.json
           SPREADSHEET_ID: ${{ github.event.inputs.spreadsheet_id }}
           POST_COUNT: ${{ github.event.inputs.post_count }}
           IMAGE_PERCENT: ${{ github.event.inputs.image_percent }}
@@ -146,6 +147,7 @@ jobs:
 
       - name: Write secrets to files
         env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
           MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
         run: |
@@ -176,7 +178,7 @@ jobs:
 
       - name: Run worker
         env:
-          GOOGLE_OAUTH_PATH: google_oauth.json
+          GOOGLE_CREDS_PATH: google_creds.json
           SPREADSHEET_ID: ${{ github.event.inputs.spreadsheet_id }}
           WORKER_ID: ${{ matrix.worker_id }}
           RUN_ID: ${{ github.run_id }}
@@ -211,11 +213,12 @@ jobs:
         run: pip install gspread google-auth google-auth-oauthlib google-auth-httplib2
       - name: Write Google OAuth
         env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
         run: python check_oauth_secret.py
       - name: Release account locks for this run
         env:
-          GOOGLE_OAUTH_PATH: google_oauth.json
+          GOOGLE_CREDS_PATH: google_creds.json
           SPREADSHEET_ID: ${{ github.event.inputs.spreadsheet_id }}
           RUN_ID: ${{ github.run_id }}
         run: python release_account_locks.py
