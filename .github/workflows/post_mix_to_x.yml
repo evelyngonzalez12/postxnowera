@@ -1,6 +1,6 @@
 # ============================================================
 # Post Mix (Images + Videos + Threads + Link Previews) to X
-# Media: mega.nz via rclone | Settings: Google Sheet (OAuth)
+# Media: mega.nz via rclone | Settings: Google Sheet (service account)
 # Secrets: MEGA_RCLONE_CONF + GOOGLE_SERVICE_ACCOUNT_JSON only
 # ============================================================
 name: Post Mix (Images + Videos + Threads + Links) to X
@@ -73,8 +73,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-      total_jobs: ${{ steps.plan.outputs.total_jobs }}
+      # Set in "Export matrix outputs" step — no secrets in that step env
+      total_jobs: ${{ steps.meta.outputs.total_jobs }}
+      worker_ids: ${{ steps.meta.outputs.worker_ids }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -87,14 +88,13 @@ jobs:
       - name: Install deps
         run: pip install gspread google-auth google-auth-oauthlib google-auth-httplib2
 
-      - name: Write Google OAuth credentials
+      - name: Write Google credentials
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
         run: python check_oauth_secret.py
 
-      - name: Plan work (dynamic locks, no LockQueue sheet)
-        id: plan
+      - name: Plan work (writes job_plan.json + worker_meta.json)
         env:
           GOOGLE_CREDS_PATH: google_creds.json
           SPREADSHEET_ID: ${{ github.event.inputs.spreadsheet_id }}
@@ -116,18 +116,44 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: job-plan-${{ github.run_id }}
-          path: job_plan.json
+          path: |
+            job_plan.json
+            worker_meta.json
           retention-days: 1
+
+      # CRITICAL: this step must NOT have any secrets in env, or GitHub may
+      # scrub job outputs ("Skip output since it may contain secret").
+      - name: Export matrix outputs
+        id: meta
+        run: |
+          python3 << 'EOF'
+          import json, os
+          from pathlib import Path
+          meta_path = Path("worker_meta.json")
+          if not meta_path.exists():
+              n, ids = 0, []
+          else:
+              meta = json.loads(meta_path.read_text())
+              n = int(meta.get("n_workers") or 0)
+              ids = meta.get("worker_ids") or list(range(n))
+          # Safe numeric / simple JSON only — never embed account or token data
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+              f.write(f"total_jobs={n}\n")
+              f.write(f"worker_ids={json.dumps(ids)}\n")
+          print(f"Exported total_jobs={n} worker_ids={ids}")
+          EOF
 
   post:
     needs: prepare
-    if: needs.prepare.outputs.total_jobs != '0'
+    if: needs.prepare.outputs.total_jobs != '0' && needs.prepare.outputs.total_jobs != ''
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       fail-fast: false
       max-parallel: 5
-      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      matrix:
+        worker_id: ${{ fromJson(needs.prepare.outputs.worker_ids) }}
     concurrency:
       group: post-mix-worker-${{ github.run_id }}-${{ matrix.worker_id }}
       cancel-in-progress: false
@@ -153,7 +179,7 @@ jobs:
         run: |
           python check_oauth_secret.py
           mkdir -p ~/.config/rclone
-          python3 -c "import os; open(os.path.expanduser('~/.config/rclone/rclone.conf'),'w').write((os.environ.get('MEGA_RCLONE_CONF') or '') + '\n')"
+          python3 -c "import os; open(os.path.expanduser('~/.config/rclone/rclone.conf'),'w').write((os.environ.get('MEGA_RCLONE_CONF') or '') + chr(10))"
           if ! grep -q '^\[mega\]' ~/.config/rclone/rclone.conf; then
             {
               echo '[mega]'
@@ -166,8 +192,7 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install playwright gspread google-auth google-auth-oauthlib \
-                      google-auth-httplib2
+          pip install playwright gspread google-auth google-auth-oauthlib google-auth-httplib2
           playwright install --with-deps chromium
 
       - name: Download job plan
@@ -199,7 +224,7 @@ jobs:
 
   cleanup:
     needs: [prepare, post]
-    if: always() && needs.prepare.outputs.total_jobs != '0'
+    if: always() && needs.prepare.outputs.total_jobs != '0' && needs.prepare.outputs.total_jobs != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -211,7 +236,7 @@ jobs:
           python-version: "3.12"
       - name: Install deps
         run: pip install gspread google-auth google-auth-oauthlib google-auth-httplib2
-      - name: Write Google OAuth
+      - name: Write Google credentials
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
