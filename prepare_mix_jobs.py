@@ -572,12 +572,8 @@ def main():
 
     if not jobs:
         dbg("No jobs planned")
-        Path("job_plan.json").write_text(json.dumps({"jobs": [], "accounts": [], "settings": {}}))
-        out = os.environ.get("GITHUB_OUTPUT", "")
-        if out:
-            with open(out, "a") as gh:
-                gh.write('matrix={"include":[]}\n')
-                gh.write("total_jobs=0\n")
+        Path("job_plan.json").write_text(json.dumps({"jobs": [], "accounts": [], "settings": {}, "workers": {}}))
+        Path("worker_meta.json").write_text(json.dumps({"n_workers": 0, "worker_ids": []}))
         return
 
     # Round-robin accounts onto jobs (storage state lives only under plan["accounts"])
@@ -606,15 +602,10 @@ def main():
     Path("job_plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     dbg(f"Wrote job_plan.json — {len(jobs)} jobs across {n_workers} workers")
 
-    matrix = {"include": [{"worker_id": str(i)} for i in range(n_workers)]}
-    out = os.environ.get("GITHUB_OUTPUT", "")
-    if out:
-        with open(out, "a") as gh:
-            gh.write(f"matrix={json.dumps(matrix, separators=(',', ':'))}\n")
-            gh.write(f"total_jobs={n_workers}\n")
-    else:
-        print("MATRIX", matrix)
-        print("TOTAL", n_workers)
+    worker_ids = list(range(n_workers))
+    meta = {"n_workers": n_workers, "worker_ids": worker_ids}
+    Path("worker_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    dbg(f"Wrote worker_meta.json n_workers={n_workers} ids={worker_ids}")
     dbg("prepare done")
 
 
