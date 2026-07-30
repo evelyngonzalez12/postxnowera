@@ -5,11 +5,38 @@ import os
 import sys
 from pathlib import Path
 
+from google.oauth2.service_account import Credentials as SACredentials
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 import gspread
 
-path = os.environ.get("GOOGLE_OAUTH_PATH", "google_oauth.json")
+
+def load_creds(path: str):
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    if data.get("type") == "service_account":
+        return SACredentials.from_service_account_info(data, scopes=scopes)
+    creds = Credentials(
+        token=data.get("token"),
+        refresh_token=data.get("refresh_token"),
+        token_uri=data.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=data.get("client_id"),
+        client_secret=data.get("client_secret"),
+        scopes=list(set(data.get("scopes") or []) | set(scopes)),
+    )
+    if not creds.valid and creds.refresh_token:
+        creds.refresh(Request())
+    return creds
+
+
+path = (
+    os.environ.get("GOOGLE_CREDS_PATH")
+    or os.environ.get("GOOGLE_OAUTH_PATH")
+    or "google_creds.json"
+)
 spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
 run_id = os.environ.get("RUN_ID", "")
 
@@ -17,28 +44,7 @@ if not spreadsheet_id or not run_id:
     print("SPREADSHEET_ID or RUN_ID missing — skip")
     sys.exit(0)
 
-data = json.loads(Path(path).read_text(encoding="utf-8"))
-scopes = list(
-    set(data.get("scopes") or [])
-    | {
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    }
-)
-creds = Credentials(
-    token=data.get("token"),
-    refresh_token=data.get("refresh_token"),
-    token_uri=data.get("token_uri", "https://oauth2.googleapis.com/token"),
-    client_id=data.get("client_id"),
-    client_secret=data.get("client_secret"),
-    scopes=scopes,
-)
-if (not creds.valid) and creds.refresh_token:
-    try:
-        creds.refresh(Request())
-    except Exception as e:
-        print(f"Token refresh warning: {e}")
-
+creds = load_creds(path)
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(spreadsheet_id)
 ws = sh.worksheet("Accounts")
