@@ -261,7 +261,15 @@ def claim_accounts(rl, sh, need: int) -> list[dict]:
         while len(row) < len(headers):
             row.append("")
         state = (row[i_state] or "").strip()
-        if not state or state in ("{}", '{"cookies":[],"origins":[]}'):
+        # Treat empty / demo placeholders as missing
+        placeholder = state in (
+            "",
+            "{}",
+            '{"cookies":[],"origins":[]}',
+            "{'cookies': [], 'origins': []}",
+        )
+        if placeholder or (state.startswith("{") and '"cookies"' in state and len(state) < 40):
+            dbg(f"Skip Accounts row {row_num}: storage_state_json empty or demo placeholder")
             continue
         enabled = "true"
         if i_en is not None:
@@ -296,9 +304,14 @@ def claim_accounts(rl, sh, need: int) -> list[dict]:
         })
 
     if not candidates:
+        dbg("HINT: Each enabled Accounts row needs a REAL Playwright storage_state JSON")
+        dbg("      in column storage_state_json (not empty, not just {\"cookies\":[],\"origins\":[]}).")
+        dbg("      Also check locked_by_run_id is empty (or stale locks older than unlock_stale_hours).")
+        dbg("      Share the sheet with the service-account email as Editor.")
         sys.exit(
             "No free accounts with storage_state_json. "
-            "Add accounts or wait for locks to expire / run cleanup."
+            "Fill Accounts.storage_state_json with a real X login state, "
+            "or clear locked_by_run_id / wait for stale unlock."
         )
 
     # Prefer accounts not yet locked by us, shuffle for fairness
@@ -567,12 +580,10 @@ def main():
                 gh.write("total_jobs=0\n")
         return
 
-    # Round-robin accounts onto jobs
+    # Round-robin accounts onto jobs (storage state lives only under plan["accounts"])
     for i, job in enumerate(jobs):
         acc = accounts[i % len(accounts)]
         job["account_id"] = acc["account_id"]
-        # workers load storage state from plan (avoid huge sheet re-reads)
-        job["storage_state_json"] = acc["storage_state_json"]
 
     n_workers = min(PARALLEL_JOBS, len(jobs))
     # Split jobs across workers
