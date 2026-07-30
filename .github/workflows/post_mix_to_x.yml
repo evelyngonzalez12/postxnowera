@@ -85,11 +85,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps
-        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow requests beautifulsoup4
+        run: pip install gspread google-auth google-auth-oauthlib google-auth-httplib2
+
       - name: Write Google OAuth credentials
         env:
           GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
-        run: printf '%s' "$GOOGLE_OAUTH_JSON" > google_oauth.json
+        run: python check_oauth_secret.py
 
       - name: Plan work (dynamic locks, no LockQueue sheet)
         id: plan
@@ -148,10 +149,9 @@ jobs:
           GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
           MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
         run: |
-          printf '%s' "$GOOGLE_OAUTH_JSON" > google_oauth.json
+          python check_oauth_secret.py
           mkdir -p ~/.config/rclone
-          printf '%s\n' "$MEGA_RCLONE_CONF" > ~/.config/rclone/rclone.conf
-          # Ensure remote is named "mega" — if user pasted without [mega] header, wrap it
+          python3 -c "import os; open(os.path.expanduser('~/.config/rclone/rclone.conf'),'w').write((os.environ.get('MEGA_RCLONE_CONF') or '') + '\n')"
           if ! grep -q '^\[mega\]' ~/.config/rclone/rclone.conf; then
             {
               echo '[mega]'
@@ -212,7 +212,7 @@ jobs:
       - name: Write Google OAuth
         env:
           GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
-        run: printf '%s' "$GOOGLE_OAUTH_JSON" > google_oauth.json
+        run: python check_oauth_secret.py
       - name: Release account locks for this run
         env:
           GOOGLE_OAUTH_PATH: google_oauth.json
