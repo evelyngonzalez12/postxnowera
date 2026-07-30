@@ -85,8 +85,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps
-        run: pip install gspread google-auth google-auth-oauthlib google-auth-httplib2
-
+        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow requests beautifulsoup4
       - name: Write Google OAuth credentials
         env:
           GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
