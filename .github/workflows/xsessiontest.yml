@@ -1,0 +1,44 @@
+name: X Session Test (no post)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Write storage state
+        env:
+          STATE_JSON: ${{ secrets.X_STORAGE_STATE_JSON }}
+        run: |
+          if [ -z "$STATE_JSON" ]; then
+            echo "ERROR: X_STORAGE_STATE_JSON secret is empty"
+            exit 1
+          fi
+          python3 -c "import os; open('x_storage_state.json','w',encoding='utf-8').write(os.environ['STATE_JSON'])"
+
+      - name: Check login only
+        run: python test_x_session.py
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-test-screenshot
+          path: debug_screenshots/
+          if-no-files-found: ignore
+          retention-days: 3
